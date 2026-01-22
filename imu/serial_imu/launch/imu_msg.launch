@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<launch>
+        <node pkg="serial_imu" name="HI226" type="serial_imu">
+            <remap from="/imu/data_raw" to="/imu/data"/>
+        </node>
+
+	<node pkg="serial_imu" name="subscriber_HI226" type="imu_subscriber"
+	output="screen" />
+</launch>

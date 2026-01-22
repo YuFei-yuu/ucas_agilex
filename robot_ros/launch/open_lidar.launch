@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<launch>
+
+    <arg name="lidar_name" default="$(optenv lidar_name rshelios_16)"/>
+    <group if="$(eval lidar_name == 'rshelios_16')">
+        <include file="$(find robot_ros)/launch/open_rshelios_16.launch"/>
+    </group> 
+    <group if="$(eval lidar_name == 'G4')">
+        <include file="$(find robot_ros)/launch/open_G4_lidar.launch"/>
+    </group> 
+    <group if="$(eval lidar_name == 'X2L')">
+        <include file="$(find robot_ros)/launch/open_X2L_lidar.launch"/>
+    </group> 
+
+</launch>

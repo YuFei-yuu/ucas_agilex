@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<launch>
+
+    <arg name="robot_name" default="$(optenv robot_name scout)"/>
+    <arg name="motion_model" default="$(optenv motion_model diff)"/>
+
+    <group if="$(eval robot_name == 'scout')">
+        <include file="$(find scout_base)/launch/scout_mini_base.launch"/>
+    </group>
+    <group if="$(eval robot_name == 'hunter')">
+        <include file="$(find hunter_base)/launch/hunter_base.launch"/>
+    </group>
+    <group if="$(eval robot_name == 'bunker')">
+        <include file="$(find bunker_base)/launch/bunker_base.launch"/>
+    </group>
+    <!-- <group if="$(eval robot_name == 'tracer')">
+        <include file="$(find tracer_base)/launch/tracer_navigation.launch"/>
+    </group> -->
+
+</launch>

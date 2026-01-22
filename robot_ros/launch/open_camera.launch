@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+
+    <arg name="camera_name" default="$(optenv camera_name D435)"/>
+    <group if="$(eval camera_name == 'D435')">
+        <include file="$(find realsense2_camera)/launch/rs_camera.launch"/>
+    </group> 
+    <group if="$(eval camera_name == 'dabai_u3')">
+        <include file="$(find astra_camera)/launch/dabai_u3.launch"/>
+    </group> 
+    
+</launch>
