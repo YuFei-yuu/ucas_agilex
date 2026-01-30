@@ -41,7 +41,7 @@
     <param name="publish_tf" value="true" />                   # wheter or not to publish the tf::transform (base->odom)  
     <param name="init_pose_from_topic" value="" /> # (Odom topic) Leave empty to start at point (0,0)
     <param name="freq" value="10.0"/>                            # Execution frequency.
-    <param name="verbose" value="true" />                       # verbose
+    <param name="verbose" value="false" />                       # verbose
   </node>
     <!--include file="$(find scout_base)/launch/scout_mini_base.launch">
       <arg name="port_name" default="can0" />

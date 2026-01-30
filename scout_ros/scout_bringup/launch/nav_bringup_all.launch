@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<launch>
+
+    <include file="$(find scout_bringup)/launch/open_rslidar.launch" />
+
+
+    <include file="$(find scout_bringup)/launch/navigation_4wd.launch" />
+
+
+    <node pkg="scout_bringup" type="send_goal.py" name="auto_goal_sender" output="screen">
+    </node>
+
+</launch>
