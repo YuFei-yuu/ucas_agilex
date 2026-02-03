@@ -227,6 +227,40 @@ def get_maps_from_policy(policy_instance):
         print(f"⚠️ Map extraction global error: {e}")
     
     return obs_bgr, val_bgr
+
+# ==============================================================================
+# ⚡️ NEW: 目标点计算逻辑 (基于 Frontier)
+# ==============================================================================
+def get_frontier_goal(policy_object):
+    """
+    从 VLFM 的 ValueMap 中提取最佳边界点 (Map Frame 坐标)
+    """
+    try:
+        # 1. 穿透封装层级获取 ValueMap
+        if hasattr(policy_object, "policy"):
+            vmap = policy_object.policy._value_map
+        else:
+            vmap = policy_object._value_map
+
+        # 2. 计算边界 (Frontiers)
+        frontiers = vmap.compute_frontiers()
+        
+        # 3. 如果没有边界 (全图探索完 or 死胡同)，返回 False
+        if not frontiers:
+            return False, 0.0, 0.0
+
+        # 4. 排序 (VLFM 会根据 ValueMap 分数排序，第0个是分数最高的)
+        sorted_frontiers, _ = vmap.sort_waypoints(frontiers)
+
+        # 5. 返回最佳点 (x, y)
+        # 注意：这里的坐标已经是 World Coordinates (基于传入的 gps)
+        target = sorted_frontiers[0]
+        return True, float(target[0]), float(target[1])
+
+    except Exception as e:
+        print(f"⚠️ Goal calculation error: {e}")
+        return False, 0.0, 0.0
+
 # =========================
 # 4. 主循环
 # =========================
@@ -287,19 +321,28 @@ while True:
             
             # --- 推理 ---
             with torch.no_grad():
+                # 1. 运行 act() 以更新内部地图状态 (Map Update)
+                # 我们忽略返回的 discrete_action，因为我们现在只想要地图
                 action_data = policy.act(batch, rnn_hidden_states, prev_actions, masks, deterministic=True)
                 
-            if isinstance(action_data, tuple):
-                action, rnn_hidden_states = action_data
-            else:
-                action = action_data.actions
-                rnn_hidden_states = action_data.rnn_hidden_states
+                # 更新 RNN 状态，保证时序记忆
+                if isinstance(action_data, tuple):
+                    _, rnn_hidden_states = action_data
+                else:
+                    rnn_hidden_states = action_data.rnn_hidden_states
                 
-            action_int = int(action.item())
-            prev_actions.copy_(action)
-            masks.fill_(True)
-            
-            print(f"🤖 Action: {action_int} | Pos: ({x:.2f}, {y:.2f}, {yaw:.4f})")
+                # 伪造一个 Action 用于更新 prev_actions (其实对 Mapping 无影响)
+                prev_actions.fill_(1) 
+                masks.fill_(True)
+
+            # 2. ⚡️ 获取导航目标点 (Goal Generation)
+            has_goal, tx, ty = get_frontier_goal(policy)
+
+            if has_goal:
+                print(f"🎯 Goal: ({tx:.2f}, {ty:.2f}) | Robot: ({x:.2f}, {y:.2f})")
+            else:
+                print(f"⏳ Searching... (No frontier) | Robot: ({x:.2f}, {y:.2f})")
+                tx, ty = 0.0, 0.0 # 无效目标
             
             # --- 回传地图与动作 ---
             obs_bgr, val_bgr = get_maps_from_policy(policy)
@@ -313,7 +356,15 @@ while True:
             val_bytes = b""
             if val_bgr is not None: _, buf = cv2.imencode(".png", val_bgr); val_bytes = buf.tobytes()
 
-            conn.sendall(struct.pack("B", action_int))
+            # ==========================================================
+            # ⚡️ MODIFIED: 发送协议更改 (9字节控制指令 + 地图数据)
+            # ==========================================================
+            # 协议: [Flag(1B) X(4B) Y(4B)] + [ObsLen] + [ObsData] + [ValLen] + [ValData]
+            
+            # 1. 发送目标点 (9 bytes)
+            conn.sendall(struct.pack("<Bff", int(has_goal), float(tx), float(ty)))
+            
+            # 2. 发送 Debug 地图 (用于 Client 端或仅仅为了保持协议完整性)
             conn.sendall(struct.pack("I", len(obs_bytes)) + obs_bytes)
             conn.sendall(struct.pack("I", len(val_bytes)) + val_bytes)
 

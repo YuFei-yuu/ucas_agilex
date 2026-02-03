@@ -8,10 +8,12 @@ import cv2
 import numpy as np
 import time
 import math
+import tf
 from sensor_msgs.msg import Image
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped
+# from nav_msgs.msg import Odometry
+# from sensor_msgs.msg import Imu
+# from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
 # ==========================================
@@ -20,26 +22,44 @@ from cv_bridge import CvBridge
 WINDOWS_IP = "192.168.31.142"   # Windows IP
 WINDOWS_PORT = 8888            
 
-# --- 动作参数 (根据实际测试调整校准) ---
-LINEAR_VEL = 0.25      # 前进速度 (m/s)
-ANGULAR_VEL = 0.8 #0.5       # 转向速度 (rad/s)
+# # --- 动作参数 (根据实际测试调整校准) ---
+# LINEAR_VEL = 0.25      # 前进速度 (m/s)
+# ANGULAR_VEL = 0.8 #0.5       # 转向速度 (rad/s)
 
-# 时间补偿 (根据实测，通常需要 1.1~1.3 倍来抵消启动延迟)
-TIME_FORWARD = (0.25 / LINEAR_VEL) * 1.05
-TIME_TURN = (0.52 / ANGULAR_VEL) * 1.1
+# # 时间补偿 (根据实测，通常需要 1.1~1.3 倍来抵消启动延迟)
+# TIME_FORWARD = (0.25 / LINEAR_VEL) * 1.05
+# TIME_TURN = (0.52 / ANGULAR_VEL) * 1.1
 
 # ==========================================
 # 全局变量
 # ==========================================
 bridge = CvBridge()
 conn = None
-cmd_pub = None
+goal_pub = None
+tf_listener = None
 
 latest_rgb = None
 latest_depth = None
-x = 0.0
-y = 0.0
-yaw = 0.0
+# x = 0.0
+# y = 0.0
+# yaw = 0.0
+
+# ==========================================
+# 辅助函数: 确保读取指定长度的数据
+# ==========================================
+def recv_all(sock, size):
+    data = b""
+    while len(data) < size:
+        try:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        except socket.timeout:
+            return None
+        except Exception:
+            return None
+    return data
 
 # ==========================================
 # 1. 网络连接逻辑
@@ -78,64 +98,36 @@ def depth_cb(msg):
     except Exception as e:
         pass
 
-def odom_cb(msg):
-    global x, y
-    x = msg.pose.pose.position.x
-    y = msg.pose.pose.position.y
+# def odom_cb(msg):
+#     global x, y
+#     x = msg.pose.pose.position.x
+#     y = msg.pose.pose.position.y
 
-def imu_cb(msg):
-    global yaw
-    q = msg.orientation
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    yaw = math.atan2(siny, cosy)
+# def imu_cb(msg):
+#     global yaw
+#     q = msg.orientation
+#     siny = 2.0 * (q.w * q.z + q.x * q.y)
+#     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+#     yaw = math.atan2(siny, cosy)
 
-# ==========================================
-# 3. 动作执行器 (阻塞式)
-# ==========================================
-def execute_action_blocking(action_code):
-    global cmd_pub
-    cmd = Twist()
-    action_name = ["STOP", "FORWARD", "LEFT", "RIGHT"]
-    
-    if action_code < 0 or action_code > 3: return
-
-    rospy.loginfo(f"烙 Action: {action_name[action_code]}")
-
-    if action_code == 0: # STOP
-        cmd.linear.x = 0.0
-        cmd.angular.z = 0.0
-        cmd_pub.publish(cmd)
-        time.sleep(0.1)
-        return
-    elif action_code == 1: # FORWARD
-        cmd.linear.x = LINEAR_VEL
-        cmd_pub.publish(cmd)
-        time.sleep(TIME_FORWARD)
-    elif action_code == 2: # LEFT
-        cmd.angular.z = ANGULAR_VEL
-        cmd_pub.publish(cmd)
-        time.sleep(TIME_TURN)
-    elif action_code == 3: # RIGHT
-        cmd.angular.z = -ANGULAR_VEL
-        cmd_pub.publish(cmd)
-        time.sleep(TIME_TURN)
-
-    # 刹车 + 稳定
-    cmd.linear.x = 0.0
-    cmd.angular.z = 0.0
-    cmd_pub.publish(cmd)
-    time.sleep(0.5) # 给相机一点稳定时间
 
 # ==========================================
 # 4. 主同步循环 (Native 640x480)
 # ==========================================
 def main_sync_loop():
-    global conn, latest_rgb, latest_depth
+    global conn, latest_rgb, latest_depth, tf_listener, goal_pub
 
     rate = rospy.Rate(10)
 
-    rospy.loginfo(" Starting 640x480 Native Loop...")
+    rospy.loginfo("Starting Navigation Loop...")
+
+    # ==========================================
+    # 1. 初始化 TF 监听器
+    # ==========================================
+    tf_listener = tf.TransformListener()
+    
+    # 等待 TF 树建立 (重要：给系统一点缓冲时间)
+    rospy.sleep(1.0) 
 
     while not rospy.is_shutdown():
         if conn is None:
@@ -144,6 +136,30 @@ def main_sync_loop():
 
         if latest_rgb is None or latest_depth is None:
             rospy.logwarn_throttle(2, "⏳ Waiting for camera data...")
+            rate.sleep()
+            continue
+
+        # ==========================================
+        # 2. 获取当前位姿 (Map Frame)
+        # ==========================================
+        current_x = 0.0
+        current_y = 0.0
+        current_yaw = 0.0
+        
+        try:
+            # 查询 /base_link 在 /map 下的坐标
+            # 注意：如果你的底盘 frame 叫 /base_footprint，请修改这里
+            (trans, rot) = tf_listener.lookupTransform('/map', '/base_link', rospy.Time(0))
+            
+            current_x = trans[0]
+            current_y = trans[1]
+            
+            # 四元数转欧拉角
+            (_, _, current_yaw) = tf.transformations.euler_from_quaternion(rot)
+            
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            rospy.logwarn_throttle(1, "⚠️ TF lookup failed. Waiting for TF tree...")
+            # 如果获取不到位姿，建议跳过本次发送，防止地图画错
             rate.sleep()
             continue
 
@@ -174,27 +190,60 @@ def main_sync_loop():
             conn.sendall(rgb_bytes)
             conn.sendall(struct.pack("I", len(depth_bytes)))
             conn.sendall(depth_bytes)
-            conn.sendall(struct.pack("fff", x, y, yaw))
+            conn.sendall(struct.pack("fff", current_x, current_y, current_yaw))
             
             # ==========================================
-            # STEP B: 阻塞接收 Action
+            # STEP 2: 接收服务器响应 (关键修改)
             # ==========================================
-            conn.settimeout(15.0) # 15秒超时
-            action_data = conn.recv(1)
+            
+            # 1. 接收目标点数据 (9 bytes: Flag + X + Y)
+            # 对应服务端: struct.pack("<Bff", ...)
+            GOAL_PACKET_SIZE = 9
+            conn.settimeout(15.0)
+            goal_data = recv_all(conn, GOAL_PACKET_SIZE)
+            
+            if not goal_data:
+                raise BrokenPipeError("Server closed connection")
+
+            has_goal, target_x, target_y = struct.unpack("<Bff", goal_data)
+
+            # 2. 发布目标点给 move_base
+            if has_goal:
+                goal_msg = PoseStamped()
+                goal_msg.header.stamp = rospy.Time.now()
+                goal_msg.header.frame_id = "map"  # 必须是 map 系
+                goal_msg.pose.position.x = target_x
+                goal_msg.pose.position.y = target_y
+                goal_msg.pose.position.z = 0.0
+                # 给一个默认朝向 (朝前)
+                goal_msg.pose.orientation.w = 1.0 
+                
+                goal_pub.publish(goal_msg)
+                rospy.loginfo(f"🎯 New Goal -> move_base: ({target_x:.2f}, {target_y:.2f})")
+            else:
+                # 没目标时可以不做处理，move_base 会保持当前状态或停下
+                # rospy.loginfo("💤 No goal received")
+                pass
+
+            # ==========================================
+            # STEP 3: 接收并排空地图数据 (协议同步)
+            # ==========================================
+            # 即使机器人不需要显示地图，也必须把socket里的数据读走！
+            # 否则下一帧发送时，socket 缓冲区里还有上一帧的地图数据，会导致解析错误。
+
+            # A. 读 Obs Map
+            len_data = recv_all(conn, 4)
+            if len_data:
+                obs_len = struct.unpack("I", len_data)[0]
+                _ = recv_all(conn, obs_len) # 读出来扔掉 (或者你可以 decode 显示)
+
+            # B. 读 Value Map
+            len_data = recv_all(conn, 4)
+            if len_data:
+                val_len = struct.unpack("I", len_data)[0]
+                _ = recv_all(conn, val_len) # 读出来扔掉
+
             conn.settimeout(None)
-            
-            if not action_data:
-                rospy.logwarn("⚠️ Server closed connection")
-                conn.close()
-                conn = None
-                continue
-
-            action_id = struct.unpack("B", action_data)[0]
-
-            # ==========================================
-            # STEP C: 执行
-            # ==========================================
-            execute_action_blocking(action_id)
 
         except socket.timeout:
             rospy.logerr("⏰ Timeout waiting for server action")
@@ -220,9 +269,9 @@ if __name__ == "__main__":
     # 确保 roslaunch realsense2_camera rs_aligned_depth.launch 已启动
     rospy.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, depth_cb) 
     
-    rospy.Subscriber("/odom", Odometry, odom_cb)
-    rospy.Subscriber("/imu/data_raw", Imu, imu_cb)
-    cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+    # rospy.Subscriber("/odom", Odometry, odom_cb)
+    # rospy.Subscriber("/imu/data_raw", Imu, imu_cb)
+    goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
 
     try:
         main_sync_loop()
