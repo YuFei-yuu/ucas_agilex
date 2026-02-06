@@ -13,7 +13,7 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
 # from nav_msgs.msg import Odometry
 # from sensor_msgs.msg import Imu
-# from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
 # ==========================================
@@ -25,6 +25,7 @@ WINDOWS_PORT = 8888
 # # --- 动作参数 (根据实际测试调整校准) ---
 # LINEAR_VEL = 0.25      # 前进速度 (m/s)
 # ANGULAR_VEL = 0.8 #0.5       # 转向速度 (rad/s)
+ROTATE_SPEED = 0.6  # rad/s
 
 # # 时间补偿 (根据实测，通常需要 1.1~1.3 倍来抵消启动延迟)
 # TIME_FORWARD = (0.25 / LINEAR_VEL) * 1.05
@@ -115,16 +116,25 @@ def depth_cb(msg):
 # 4. 主同步循环 (Native 640x480)
 # ==========================================
 def main_sync_loop():
+    # global conn, latest_rgb, latest_depth, goal_pub
+
     global conn, latest_rgb, latest_depth, tf_listener, goal_pub
+    cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
 
     rate = rospy.Rate(10)
 
     rospy.loginfo("Starting Navigation Loop...")
 
+    # --- 【新增 1】 初始化阶段的状态变量 ---
+    initial_spin_done = False  # 是否完成了初始旋转
+    total_yaw_rotated = 0.0    # 累计转过的角度 (弧度)
+    last_yaw_capture = None    # 上一帧的 Yaw 角
+    # ------------------------------------
+
     # ==========================================
     # 1. 初始化 TF 监听器
     # ==========================================
-    tf_listener = tf.TransformListener()
+    # tf_listener = tf.TransformListener()
     
     # 等待 TF 树建立 (重要：给系统一点缓冲时间)
     rospy.sleep(1.0) 
@@ -137,7 +147,7 @@ def main_sync_loop():
         if latest_rgb is None or latest_depth is None:
             rospy.logwarn_throttle(2, "⏳ Waiting for camera data...")
             rate.sleep()
-            continue
+            continuec
 
         # ==========================================
         # 2. 获取当前位姿 (Map Frame)
@@ -147,6 +157,10 @@ def main_sync_loop():
         current_yaw = 0.0
         
         try:
+            # 【关键修复】: 先等待变换关系可用，最多等 1.0 秒
+            # 这能防止因 TF 还没同步好就直接查询导致的报错
+            tf_listener.waitForTransform('/map', '/base_link', rospy.Time(), rospy.Duration(0.5))
+            
             # 查询 /base_link 在 /map 下的坐标
             # 注意：如果你的底盘 frame 叫 /base_footprint，请修改这里
             (trans, rot) = tf_listener.lookupTransform('/map', '/base_link', rospy.Time(0))
@@ -158,7 +172,7 @@ def main_sync_loop():
             (_, _, current_yaw) = tf.transformations.euler_from_quaternion(rot)
             
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-            rospy.logwarn_throttle(1, "⚠️ TF lookup failed. Waiting for TF tree...")
+            rospy.logwarn_throttle(1, f"⚠️ TF lookup failed: {e}. Waiting for TF tree...")
             # 如果获取不到位姿，建议跳过本次发送，防止地图画错
             rate.sleep()
             continue
@@ -192,56 +206,81 @@ def main_sync_loop():
             conn.sendall(depth_bytes)
             conn.sendall(struct.pack("fff", current_x, current_y, current_yaw))
             
+            # 接收 10 字节数据
+            goal_data = recv_all(conn, 10)
+            if not goal_data: raise BrokenPipeError("Server closed")
+
+            action_id, has_goal, target_x, target_y = struct.unpack("<BBff", goal_data)
+
+
             # ==========================================
-            # STEP 2: 接收服务器响应 (关键修改)
+            # 【新增 2】 初始化旋转逻辑 (优先权最高)
+            # ==========================================
+            if not initial_spin_done:
+                # 第一次进入循环，初始化 last_yaw
+                if last_yaw_capture is None:
+                    last_yaw_capture = current_yaw
+                
+                # 计算这一帧转了多少度 (处理 -pi 到 pi 的跳变)
+                delta_yaw = current_yaw - last_yaw_capture
+                
+                # 修正角度跳变：例如从 3.14 变到 -3.14，实际只转了一点点，但数学差值很大
+                if delta_yaw < -math.pi:
+                    delta_yaw += 2 * math.pi
+                elif delta_yaw > math.pi:
+                    delta_yaw -= 2 * math.pi
+                
+                # 累加绝对值
+                total_yaw_rotated += abs(delta_yaw)
+                last_yaw_capture = current_yaw # 更新上一帧角度
+
+                # 判断是否转够了一圈 (2 * PI ≈ 6.28, 这里给 6.4 确保覆盖)
+                if total_yaw_rotated < 6.3:
+                    twist = Twist()
+                    twist.angular.z = 0.3  # 旋转速度，请与你的 DWA 参数匹配
+                    cmd_pub.publish(twist)
+                    rospy.loginfo_throttle(1.0, f" Initial Scanning... Rotated: {math.degrees(total_yaw_rotated):.1f}/360 deg")
+                    
+                    # 关键：初始化阶段，跳过后面的导航逻辑，直接进入下一次循环
+                    # 这样 Server 虽然发了 goal，但我们会忽略，直到扫图完成
+                    continue 
+                else:
+                    # 转完了
+                    initial_spin_done = True
+                    cmd_pub.publish(Twist()) # 刹车一次
+                    rospy.loginfo("✅ Initial Scan Completed! Switching to Auto Navigation.")
+                    # 继续向下执行正常的导航逻辑...
+
+            
+            # ==========================================
+            # ⚡️ 极简控制逻辑 (Direct Global Goal)
             # ==========================================
             
-            # 1. 接收目标点数据 (9 bytes: Flag + X + Y)
-            # 对应服务端: struct.pack("<Bff", ...)
-            GOAL_PACKET_SIZE = 9
-            conn.settimeout(15.0)
-            goal_data = recv_all(conn, GOAL_PACKET_SIZE)
-            
-            if not goal_data:
-                raise BrokenPipeError("Server closed connection")
-
-            has_goal, target_x, target_y = struct.unpack("<Bff", goal_data)
-
-            # 2. 发布目标点给 move_base
             if has_goal:
+                # ✅ 核心逻辑：直接把 Frontier 给 move_base
                 goal_msg = PoseStamped()
                 goal_msg.header.stamp = rospy.Time.now()
-                goal_msg.header.frame_id = "map"  # 必须是 map 系
+                goal_msg.header.frame_id = "map"
                 goal_msg.pose.position.x = target_x
                 goal_msg.pose.position.y = target_y
                 goal_msg.pose.position.z = 0.0
-                # 给一个默认朝向 (朝前)
                 goal_msg.pose.orientation.w = 1.0 
                 
                 goal_pub.publish(goal_msg)
-                rospy.loginfo(f"🎯 New Goal -> move_base: ({target_x:.2f}, {target_y:.2f})")
+                # rospy.loginfo(f"�� Navigation: Go to Frontier ({target_x:.2f}, {target_y:.2f})")
+                
+                # 如果之前在旋转，现在不需要手动停，move_base 会接管 cmd_vel
+            
             else:
-                # 没目标时可以不做处理，move_base 会保持当前状态或停下
-                # rospy.loginfo("💤 No goal received")
-                pass
-
-            # ==========================================
-            # STEP 3: 接收并排空地图数据 (协议同步)
-            # ==========================================
-            # 即使机器人不需要显示地图，也必须把socket里的数据读走！
-            # 否则下一帧发送时，socket 缓冲区里还有上一帧的地图数据，会导致解析错误。
-
-            # A. 读 Obs Map
-            len_data = recv_all(conn, 4)
-            if len_data:
-                obs_len = struct.unpack("I", len_data)[0]
-                _ = recv_all(conn, obs_len) # 读出来扔掉 (或者你可以 decode 显示)
-
-            # B. 读 Value Map
-            len_data = recv_all(conn, 4)
-            if len_data:
-                val_len = struct.unpack("I", len_data)[0]
-                _ = recv_all(conn, val_len) # 读出来扔掉
+                # ❌ 没有 Frontier (通常是初始化阶段或死胡同)
+                # 执行原地旋转来更新地图
+                twist = Twist()
+                if action_id == 2: # Server 请求旋转
+                    twist.angular.z = 0.3
+                    cmd_pub.publish(twist)
+                    rospy.loginfo_throttle(1.0, "�� Searching for Frontier (Spinning)...")
+                else:
+                    cmd_pub.publish(Twist()) # 停
 
             conn.settimeout(None)
 
@@ -261,7 +300,7 @@ def main_sync_loop():
 
 if __name__ == "__main__":
     rospy.init_node("robot_vlfm_agent", anonymous=True)
-
+    tf_listener = tf.TransformListener()
     # ✅ 订阅 RGB
     rospy.Subscriber("/camera/color/image_raw", Image, rgb_cb)
     
@@ -271,7 +310,7 @@ if __name__ == "__main__":
     
     # rospy.Subscriber("/odom", Odometry, odom_cb)
     # rospy.Subscriber("/imu/data_raw", Imu, imu_cb)
-    goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+    goal_pub = rospy.Publisher("/target_goal", PoseStamped, queue_size=1)
 
     try:
         main_sync_loop()

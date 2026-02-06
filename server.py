@@ -20,26 +20,14 @@ from habitat_baselines.common.tensor_dict import TensorDict
 from gym import spaces
 
 # ==============================================================================
-# 3. 关键修复：手动注册 VLFM 所有模块
-# (必须显式导入这些文件，@register 装饰器才会生效)
+# 3. 注册 VLFM 模块
 # ==============================================================================
-
-# [A] 注册 Measurements (解决 "Could not load traveled_stairs")
 import vlfm.measurements.traveled_stairs  
-
-# [B] 注册 Policies (解决 "NoneType object has no attribute from_config")
-# 你的 yaml 里写的是 name: "HabitatITMPolicyV2"，它就在这里面定义
 import vlfm.policy.habitat_policies   
-import vlfm.policy.reality_policies   # 如果用到真机特定策略也需要
-
-# [C] 注册 Mapping (解决地图相关报错)
+import vlfm.policy.reality_policies   
 import vlfm.mapping.frontier_map          
 import vlfm.mapping.obstacle_map          
 import vlfm.mapping.value_map             
-
-# ==============================================================================
-# 下面接你的 load_vlfm_policy 函数和主循环...
-# ==============================================================================
 
 # =========================
 # ⚙️ 配置区域
@@ -50,115 +38,55 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 VIS_DIR = "vlfm_vis"
 os.makedirs(VIS_DIR, exist_ok=True)
 
-# 目标分辨率 (VLFM 默认训练分辨率)
-TARGET_SIZE = (640, 480) 
+TARGET_SIZE = (224, 224)  
 TARGET_OBJECT_ID = 2  
 
 # =========================
-# 🛠️ 1. 复刻 VLFM Resize 逻辑
+# ��️ 1. 图像预处理工具
 # =========================
-# 来源: vlfm/obs_transformers/utils.py
-def image_resize(
-    img: torch.Tensor,
-    size: tuple,
-    channels_last: bool = False,
-    interpolation_mode: str = "area",
-) -> torch.Tensor:
-    """
-    完全一致的 PyTorch Resize 实现
-    """
+def image_resize(img: torch.Tensor, size: tuple, channels_last: bool = False, interpolation_mode: str = "area") -> torch.Tensor:
     img = torch.as_tensor(img)
     no_batch_dim = len(img.shape) == 3
-    if len(img.shape) < 3 or len(img.shape) > 5:
-        raise NotImplementedError()
-    if no_batch_dim:
-        img = img.unsqueeze(0)  # Adds a batch dimension (N, H, W, C)
+    if no_batch_dim: img = img.unsqueeze(0)
     
-    # 调整维度顺序以适应 torch.interpolate (需要 N, C, H, W)
     if channels_last:
-        if len(img.shape) == 4:
-            # NHWC -> NCHW
-            img = img.permute(0, 3, 1, 2)
-        else:
-            # NDHWC -> NDCHW
-            img = img.permute(0, 1, 4, 2, 3)
+        if len(img.shape) == 4: img = img.permute(0, 3, 1, 2)
+        else: img = img.permute(0, 1, 4, 2, 3)
 
-    # 核心操作：Float 转换 -> Interpolate -> 原类型转换(在Policy外通常保持Float)
-    # 注意：源码中最后 .to(dtype=img.dtype) 会转回原类型
-    # 但在推理时，我们希望尽快转成 Float32 进入网络，所以这里我们略微修改，
-    # 既然输入已经是 Float32 (我们自己转的)，输出也是 Float32。
     img = torch.nn.functional.interpolate(img.float(), size=size, mode=interpolation_mode)
     
     if channels_last:
-        if len(img.shape) == 4:
-            # NCHW -> NHWC
-            img = img.permute(0, 2, 3, 1)
-        else:
-            # NDCHW -> NDHWC
-            img = img.permute(0, 1, 3, 4, 2)
-    if no_batch_dim:
-        img = img.squeeze(dim=0)  # Removes the batch dimension
+        if len(img.shape) == 4: img = img.permute(0, 2, 3, 1)
+        else: img = img.permute(0, 1, 3, 4, 2)
+    if no_batch_dim: img = img.squeeze(dim=0)
     return img
 
 def preprocess_obs_vlfm_style(rgb_np, depth_mm_np, device):
-    """
-    完全遵循 VLFM pipeline 的预处理
-    """
-    # 1. 转为 Tensor
-    # RGB: [H, W, 3] -> Float
     rgb_tensor = torch.from_numpy(rgb_np).float().to(device)
-    
-    # Depth: [H, W] -> [H, W, 1] -> Float Meters
     depth_m_tensor = torch.from_numpy(depth_mm_np).float().to(device) / 1000.0
-    depth_m_tensor = depth_m_tensor.unsqueeze(-1) # [H, W, 1]
+    depth_m_tensor = depth_m_tensor.unsqueeze(-1)
 
-    # 2. 执行 Resize (使用 "area" 插值，这非常关键！)
-    # 对应源码 resize.py: interpolation_mode = "area"
-    rgb_resized = image_resize(
-        rgb_tensor, 
-        TARGET_SIZE, 
-        channels_last=True, 
-        interpolation_mode="area"
-    )
-    
-    depth_resized = image_resize(
-        depth_m_tensor, 
-        TARGET_SIZE, 
-        channels_last=True, 
-        interpolation_mode="area"
-    )
-
-    # 3. 归一化 / 类型转换
-    # RGB 通常 Policy 内部会处理 (或者需要 /255.0)，VLFM Policy 内部有 NormalizeVisualInputs 吗？
-    # 查看 pointnav_policy.py: normalize_visual_inputs=False (如果 habitat_version 0.1.5)
-    # 但 VLFM 的 yaml 配置里可能有。
-    # 安全起见：保持 uint8 范围的 float (0-255) 或者归一化。
-    # 大多数 Habitat Policy 期望 RGB 是 [0, 255] 的 uint8 或者 float。
-    # Depth 必须归一化到 [0, 1]。
-    
-    # Habitat 标准 Depth 归一化: clamp(d, min, max) -> normalize
-    # 假设 min=0, max=5.0 (和之前 config 一致)
+    rgb_resized = image_resize(rgb_tensor, TARGET_SIZE, channels_last=True, interpolation_mode="area")
+    depth_resized = image_resize(depth_m_tensor, TARGET_SIZE, channels_last=True, interpolation_mode="area")
     depth_norm = torch.clamp(depth_resized, 0.0, 5.0) / 5.0
 
-    return rgb_resized.byte(), depth_norm # RGB 转回 byte 以匹配 Space 定义, Depth 保持 Float
+    return rgb_resized.byte(), depth_norm
 
 # =========================
-# 2. 加载 VLFM Policy (不变)
+# �� 2. 加载 Policy
 # =========================
 def load_vlfm_policy():
-    print(f"🔥 Initializing VLFM Full System on {DEVICE}...")
+    print(f"�� Initializing VLFM Full System on {DEVICE}...")
     config_path = "/home/sxz/sjd/vlfm/config/experiments/vlfm_objectnav_hm3d.yaml"
+    
     config = get_config(config_path, [
         "habitat_baselines.rl.policy.name=HabitatITMPolicyV2",
-        # 即使这里写了 size，我们现在的 resize 是手动做的，
-        # 所以这里的配置主要是为了让 Policy 初始化正确的卷积层
         "habitat.simulator.agents.main_agent.sim_sensors.depth_sensor.width=224", 
         "habitat.simulator.agents.main_agent.sim_sensors.depth_sensor.height=224",
-
     ])
     
     policy_cls = baseline_registry.get_policy(config.habitat_baselines.rl.policy.name)
-    print("fov, camera_height:", config.habitat.simulator.agents.main_agent.sim_sensors.depth_sensor.hfov, config.habitat.simulator.agents.main_agent.sim_sensors.depth_sensor.position)
+    
     obs_space = spaces.Dict({
         "rgb": spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
         "depth": spaces.Box(low=0.0, high=1.0, shape=(224, 224, 1), dtype=np.float32),
@@ -177,7 +105,7 @@ def load_vlfm_policy():
 policy = load_vlfm_policy()
 
 # =========================
-# 3. 辅助函数
+# �� 3. 核心工具函数
 # =========================
 def recv_all(conn, size: int) -> bytes:
     data = b""
@@ -229,49 +157,76 @@ def get_maps_from_policy(policy_instance):
     return obs_bgr, val_bgr
 
 # ==============================================================================
-# ⚡️ NEW: 目标点计算逻辑 (基于 Frontier)
+# ⚡️ 深度搜索工具：找到我们刚刚修改源码暴露出来的变量
 # ==============================================================================
-def get_frontier_goal(policy_object):
+def find_attribute_recursive(obj, attr_name, depth=0, visited=None):
+    if visited is None: visited = set()
+    if depth > 5: return None # 防止无限递归
+    
+    # 避免循环引用死锁
+    obj_id = id(obj)
+    if obj_id in visited: return None
+    visited.add(obj_id)
+
+    # 1. 检查当前对象是否有该属性
+    if hasattr(obj, attr_name):
+        return getattr(obj, attr_name)
+    
+    # 2. 检查常见子节点 (VLFM 的套娃结构)
+    children = ["mapper", "policy", "net", "actor_critic", "module", "action_distribution"]
+    for child_name in children:
+        if hasattr(obj, child_name):
+            res = find_attribute_recursive(getattr(obj, child_name), attr_name, depth + 1, visited)
+            if res is not None: return res
+            
+    return None
+
+def get_best_frontier_goal(policy_instance):
     """
-    从 VLFM 的 ValueMap 中提取最佳边界点 (Map Frame 坐标)
+    提取我们在源码中注入的 server_target_proxy 变量
     """
     try:
-        # 1. 穿透封装层级获取 ValueMap
-        if hasattr(policy_object, "policy"):
-            vmap = policy_object.policy._value_map
-        else:
-            vmap = policy_object._value_map
-
-        # 2. 计算边界 (Frontiers)
-        frontiers = vmap.compute_frontiers()
+        # 1. 递归查找我们在源码里写的那个变量名 "server_target_proxy"
+        target = find_attribute_recursive(policy_instance, "server_target_proxy")
         
-        # 3. 如果没有边界 (全图探索完 or 死胡同)，返回 False
-        if not frontiers:
-            return False, 0.0, 0.0
+        # 2. 如果源码还没生效，尝试读取 _last_frontier (VLFM 自带的缓存，也是你提供的源码里有的)
+        if target is None:
+             target = find_attribute_recursive(policy_instance, "_last_frontier")
+    
+        # 3. 解析坐标
+        if target is not None:
+            # 确保转为 numpy
+            if torch.is_tensor(target):
+                f_cpu = target.detach().cpu().numpy().flatten()
+            else:
+                f_cpu = np.array(target).flatten()
 
-        # 4. 排序 (VLFM 会根据 ValueMap 分数排序，第0个是分数最高的)
-        sorted_frontiers, _ = vmap.sort_waypoints(frontiers)
-
-        # 5. 返回最佳点 (x, y)
-        # 注意：这里的坐标已经是 World Coordinates (基于传入的 gps)
-        target = sorted_frontiers[0]
-        return True, float(target[0]), float(target[1])
-
+            # 坐标检查
+            if len(f_cpu) >= 2:
+                tx, ty = float(f_cpu[0]), float(f_cpu[1])
+                
+                # 排除 (0,0) 无效点
+                if abs(tx) > 0.01 or abs(ty) > 0.01:
+                    return True, tx, ty
+                    
     except Exception as e:
-        print(f"⚠️ Goal calculation error: {e}")
-        return False, 0.0, 0.0
+        print(f"❌ Error extracting frontier: {e}")
+
+    return False, 0.0, 0.0
 
 # =========================
-# 4. 主循环
+# �� 4. 主循环
 # =========================
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((SERVER_IP, SERVER_PORT))
 sock.listen(1)
-print(f"🚀 Server listening on {SERVER_PORT}...")
+print(f"�� Server listening on {SERVER_PORT}...")
 
-counter=0
+counter = 0
+
 while True:
+    print("⏳ Waiting for connection...")
     conn, addr = sock.accept()
     print(f"✅ Robot connected: {addr}")
     
@@ -283,15 +238,14 @@ while True:
 
     try:
         while True:
-            
-            # --- 接收 RGB (Native 640x480) ---
+            # 1. 接收 Header (RGB Size)
             header = recv_all(conn, 4)
             if not header: break
             rgb_size = struct.unpack("I", header)[0]
             rgb_bytes = recv_all(conn, rgb_size)
             rgb_np = cv2.imdecode(np.frombuffer(rgb_bytes, np.uint8), cv2.IMREAD_COLOR)
             
-            # --- 接收 Depth (Native 640x480) ---
+            # 2. 接收 Depth Size
             header = recv_all(conn, 4)
             if not header: break
             depth_size = struct.unpack("I", header)[0]
@@ -299,77 +253,84 @@ while True:
             depth_img = Image.open(io.BytesIO(depth_bytes))
             depth_mm_np = np.array(depth_img).astype(np.float32)
 
-            # --- 接收 State ---
+            # 3. 接收 State (X, Y, Yaw)
             state_bytes = recv_all(conn, 12)
             if not state_bytes: break
             x, y, yaw = struct.unpack("fff", state_bytes)
-            # yaw = - yaw
-            # ==========================================
-            # ⚡️ 核心修改：使用 VLFM 原生预处理
-            # ==========================================
+            
+            # 4. 预处理
             rgb_tensor, depth_tensor = preprocess_obs_vlfm_style(rgb_np, depth_mm_np, DEVICE)
 
-            # 构造 Batch (增加 Batch 维度)
+            # 5. 构造 Batch
             batch = TensorDict({
-                "rgb": rgb_tensor.unsqueeze(0),       # [1, 224, 224, 3]
-                "depth": depth_tensor.unsqueeze(0),   # [1, 224, 224, 1]
+                "rgb": rgb_tensor.unsqueeze(0),
+                "depth": depth_tensor.unsqueeze(0),
                 "objectgoal": object_goal_tensor,
                 "gps": torch.tensor([[x, y]], device=DEVICE, dtype=torch.float32),
                 "compass": torch.tensor([[yaw]], device=DEVICE, dtype=torch.float32),
                 "heading": torch.tensor([[yaw]], device=DEVICE, dtype=torch.float32)
             })
             
-            # --- 推理 ---
+            # ==========================================
+            # ⚡️ FIX 1: 提前初始化变量，防止报错
+            # ==========================================
+            discrete_val = 0 
+            
+            # 6. VLFM 推理 (Update Map)
             with torch.no_grad():
-                # 1. 运行 act() 以更新内部地图状态 (Map Update)
-                # 我们忽略返回的 discrete_action，因为我们现在只想要地图
+                # policy.act 会更新内部地图
                 action_data = policy.act(batch, rnn_hidden_states, prev_actions, masks, deterministic=True)
                 
-                # 更新 RNN 状态，保证时序记忆
+                # 提取动作 (无论是否用到，都要提取以更新 RNN 状态)
                 if isinstance(action_data, tuple):
-                    _, rnn_hidden_states = action_data
+                    actions_tensor, rnn_hidden_states = action_data
+                    discrete_val = actions_tensor[0].item()
                 else:
                     rnn_hidden_states = action_data.rnn_hidden_states
-                
-                # 伪造一个 Action 用于更新 prev_actions (其实对 Mapping 无影响)
-                prev_actions.fill_(1) 
+                    if hasattr(action_data, "actions"):
+                        discrete_val = action_data.actions[0].item()
+
+                prev_actions.copy_(torch.tensor([[discrete_val]], device=DEVICE, dtype=torch.long))
                 masks.fill_(True)
 
-            # 2. ⚡️ 获取导航目标点 (Goal Generation)
-            has_goal, tx, ty = get_frontier_goal(policy)
-
-            if has_goal:
-                print(f"🎯 Goal: ({tx:.2f}, {ty:.2f}) | Robot: ({x:.2f}, {y:.2f})")
-            else:
-                print(f"⏳ Searching... (No frontier) | Robot: ({x:.2f}, {y:.2f})")
-                tx, ty = 0.0, 0.0 # 无效目标
+            # ==========================================================
+            # ⚡️⚡️ 决策核心：直接拿 Best Frontier ⚡️⚡️
+            # ==========================================================
             
-            # --- 回传地图与动作 ---
-            obs_bgr, val_bgr = get_maps_from_policy(policy)
-            counter+=1
-            # 可视化 (可选)
-            if obs_bgr is not None and VIS_DIR:
-                cv2.imwrite(f"{VIS_DIR}/obs_{counter}.png", obs_bgr)
+            # A. 调用函数提取 frontier
+            has_goal, tx, ty = get_best_frontier_goal(policy)
+            
+            final_action = discrete_val # 默认行为
+            
+            if has_goal:
+                # 只要有全局 Frontier，就告诉小车 "Action 1 (FORWARD)" 模式，并带上坐标
+                final_action = 1 
+                print(f"�� Use Best Frontier: ({tx:.2f}, {ty:.2f})")
+            else:
+                # 还没算出来 (Initialize 阶段)，保持 Policy 建议的离散动作 (比如转圈)
+                print(f"�� Init Mode (Spinning): Action {discrete_val}")
+                tx, ty = 0.0, 0.0
 
+            # 7. 准备地图数据
+            obs_bgr, val_bgr = get_maps_from_policy(policy)
+            counter += 1
+            
             obs_bytes = b""
             if obs_bgr is not None: _, buf = cv2.imencode(".png", obs_bgr); obs_bytes = buf.tobytes()
             val_bytes = b""
             if val_bgr is not None: _, buf = cv2.imencode(".png", val_bgr); val_bytes = buf.tobytes()
 
-            # ==========================================================
-            # ⚡️ MODIFIED: 发送协议更改 (9字节控制指令 + 地图数据)
-            # ==========================================================
-            # 协议: [Flag(1B) X(4B) Y(4B)] + [ObsLen] + [ObsData] + [ValLen] + [ValData]
+            # 8. 发送数据包
+            # 格式: <B: ActionID, B: Flag, f: x, f: y (共 10 bytes)
+            packet = struct.pack("<BBff", final_action, int(has_goal), float(tx), float(ty))
+            conn.sendall(packet)
             
-            # 1. 发送目标点 (9 bytes)
-            conn.sendall(struct.pack("<Bff", int(has_goal), float(tx), float(ty)))
-            
-            # 2. 发送 Debug 地图 (用于 Client 端或仅仅为了保持协议完整性)
+            # 发送地图
             conn.sendall(struct.pack("I", len(obs_bytes)) + obs_bytes)
             conn.sendall(struct.pack("I", len(val_bytes)) + val_bytes)
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Connection Error: {e}")
         import traceback; traceback.print_exc()
     finally:
-        conn.close()
+        if conn: conn.close()
