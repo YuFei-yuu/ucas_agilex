@@ -163,8 +163,9 @@ def main_sync_loop():
             
             # 查询 /base_link 在 /map 下的坐标
             # 注意：如果你的底盘 frame 叫 /base_footprint，请修改这里
-            (trans, rot) = tf_listener.lookupTransform('/map', '/base_link', rospy.Time(0))
-            
+            # (trans, rot) = tf_listener.lookupTransform('/map', '/base_link', rospy.Time(0))
+            (trans, rot) = tf_listener.lookupTransform('/map', '/base_footprint', rospy.Time(0))
+
             current_x = trans[0]
             current_y = trans[1]
             

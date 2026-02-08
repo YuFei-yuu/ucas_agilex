@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+
+  <include file="$(find scout_base)/launch/scout_mini_base.launch">
+      <arg name="port_name" default="can0" />
+      <arg name="simulated_robot" default="false" />
+  </include>
+
+  <node name="map_server" pkg="map_server" type="map_server" args="$(find scout_description)/maps/map.yaml" output="screen">
+      <param name="frame_id" value="map"/>
+      <remap from="map" to="static_map"/> 
+  </node>
+
+  <include file="$(find scout_bringup)/launch/gmapping_mod.launch" />
+
+
+<node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+    
+    <rosparam file="$(find scout_description)/param/4wd/costmap_common_params.yaml" command="load" ns="global_costmap" />
+    <rosparam file="$(find scout_description)/param/4wd/costmap_common_params.yaml" command="load" ns="local_costmap" />
+    <rosparam file="$(find scout_description)/param/4wd/local_costmap_params.yaml" command="load" />
+    <rosparam file="$(find scout_description)/param/4wd/base_local_planner_params.yaml" command="load" />
+    <rosparam file="$(find scout_description)/param/4wd/move_base_params.yaml" command="load" />
+    
+    <rosparam file="$(find scout_description)/param/4wd/global_costmap_params.yaml" command="load" />
+  </node>
+
+  <node name="rviz_nav" pkg="rviz" type="rviz" args="-d $(find scout_description)/rviz/rviz_navigation.rviz" />
+
+</launch>
