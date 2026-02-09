@@ -6,8 +6,11 @@
     <!-- 启动相机>-->
     <include file="$(find realsense2_camera)/launch/rs_aligned_depth.launch" />
 
-    <include file="$(find scout_bringup)/launch/navigation_4wd.launch" />
+    <!-- map==odom -->
+    <!-- <include file="$(find scout_bringup)/launch/navigation_4wd.launch" /> -->
 
+    <!-- gmapping 维护 map2odom -->
+    <include file="$(find scout_bringup)/launch/blind_navigation.launch" />
 
     <node pkg="scout_bringup" type="send_goal.py" name="auto_goal_sender" output="screen">
     </node>
